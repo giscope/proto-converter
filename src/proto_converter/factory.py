@@ -41,7 +41,7 @@ T = TypeVar("T", bound=Message)
 _converter_cache: Dict[str, ProtoConverter] = {}
 
 
-def get_cached_converter(mapping_path: Path) -> ProtoConverter:
+def get_cached_converter(mapping_path: Path | str) -> ProtoConverter:
     """
     Retrieve or initialize a cached `ProtoConverter` for the given mapping YAML.
 
@@ -50,11 +50,14 @@ def get_cached_converter(mapping_path: Path) -> ProtoConverter:
     streaming data (hundreds of positions or transactions per second).
 
     Args:
-        mapping_path: The absolute Path to the YAML mapping configuration.
+        mapping_path: The absolute Path or string path to the YAML mapping configuration.
 
     Returns:
         ProtoConverter: A reusable, thread-safe (stateless) converter instance.
     """
+    if isinstance(mapping_path, str):
+        mapping_path = Path(mapping_path)
+        
     key = str(mapping_path.resolve())
     if key not in _converter_cache:
         config = load_yaml_with_includes(mapping_path)
