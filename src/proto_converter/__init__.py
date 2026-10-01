@@ -9,7 +9,8 @@ Features:
 - Factory pattern with caching for high-throughput scenarios
 - Pluggable transform and expression registries
 - YAML !include directive for reusable mapping fragments
-- Sandboxed expression evaluation for computed fields
+- Sandboxed expression evaluation for computed fields (opt-in native engine)
+- Mappings compiled to generated Python on first use
 - Text and binary serialization support
 
 Quick Start:
@@ -27,6 +28,13 @@ from proto_converter.converter import (
     ProtoConverter,
     register_expression_function,
     register_expression_name,
+)
+
+# Expression engines
+from proto_converter.expressions import (
+    EXPRESSION_ENGINES,
+    get_default_expression_engine,
+    set_default_expression_engine,
 )
 
 # Factory pattern
@@ -67,6 +75,9 @@ __all__ = [
     "register_transform",
     "register_expression_function",
     "register_expression_name",
+    "set_default_expression_engine",
+    "get_default_expression_engine",
+    "EXPRESSION_ENGINES",
     "TRANSFORMS",
     # Helpers
     "get_nested_value",

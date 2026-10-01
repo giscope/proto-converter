@@ -18,10 +18,12 @@ Usage:
 """
 
 import logging
+import os
+import threading
 import yaml
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
 
 from google.protobuf.message import Message
 
@@ -37,11 +39,20 @@ T = TypeVar("T", bound=Message)
 # Global Converter Cache
 # =============================================================================
 
-# Class-level cache for ProtoConverter instances, keyed by mapping file path
+# Class-level cache for ProtoConverter instances, keyed by resolved mapping file path
 _converter_cache: Dict[str, ProtoConverter] = {}
 
+# The same converters keyed by the path as callers spell it, so the per-call cost is a
+# dict lookup instead of `Path.resolve()` (filesystem calls, ~20 µs). Relative paths
+# are keyed with the working directory they were resolved against.
+_path_cache: Dict[Union[str, tuple], ProtoConverter] = {}
+_load_lock = threading.Lock()
 
-def get_cached_converter(mapping_path: Path | str) -> ProtoConverter:
+# Bumped by clear_converter_cache() so factories drop the converters they remember
+_cache_generation = 0
+
+
+def get_cached_converter(mapping_path: Union[Path, str]) -> ProtoConverter:
     """
     Retrieve or initialize a cached `ProtoConverter` for the given mapping YAML.
 
@@ -49,20 +60,29 @@ def get_cached_converter(mapping_path: Path | str) -> ProtoConverter:
     happens only once per mapping file, which is critical for high-throughput
     streaming data (hundreds of positions or transactions per second).
 
+    Converters are cached by path; call `clear_converter_cache()` after changing
+    mapping files on disk.
+
     Args:
         mapping_path: The absolute Path or string path to the YAML mapping configuration.
 
     Returns:
         ProtoConverter: A reusable, thread-safe (stateless) converter instance.
     """
-    if isinstance(mapping_path, str):
-        mapping_path = Path(mapping_path)
-        
-    key = str(mapping_path.resolve())
-    if key not in _converter_cache:
-        config = load_yaml_with_includes(mapping_path)
-        _converter_cache[key] = ProtoConverter(config)
-    return _converter_cache[key]
+    spelled = os.fspath(mapping_path)
+    key = spelled if os.path.isabs(spelled) else (os.getcwd(), spelled)
+    converter = _path_cache.get(key)
+    if converter is not None:
+        return converter
+
+    with _load_lock:
+        resolved = str(Path(spelled).resolve())
+        converter = _converter_cache.get(resolved)
+        if converter is None:
+            config = load_yaml_with_includes(spelled)
+            converter = _converter_cache[resolved] = ProtoConverter(config)
+        _path_cache[key] = converter
+    return converter
 
 
 def clear_converter_cache() -> None:
@@ -73,9 +93,11 @@ def clear_converter_cache() -> None:
     restarting the server process.
     """
     _converter_cache.clear()
+    _path_cache.clear()
     _mapping_id_registry.clear()
-    global _registry_initialized
+    global _registry_initialized, _cache_generation
     _registry_initialized = False
+    _cache_generation += 1
 
 
 # =============================================================================
@@ -181,6 +203,9 @@ class BaseProtoFactory(ABC, Generic[T]):
         """
         Registry of source names to their corresponding YAML mapping file paths.
 
+        Mappings are static: each source's path is read once per factory instance
+        and its converter remembered until `clear_converter_cache()`.
+
         Example:
             {"etrade": Path("mappings/etrade_pos.yaml"), "ibkr": Path("mappings/ibkr_pos.yaml")}
         """
@@ -189,6 +214,9 @@ class BaseProtoFactory(ABC, Generic[T]):
     def _get_converter(self, source: str) -> ProtoConverter:
         """
         Retrieve the cached converter for the source, validating type compatibility.
+
+        After the first successful lookup for a source this is one dict lookup:
+        `mappings` and `proto_class` are static, so neither is read again.
 
         Args:
             source: The source identifier (e.g., 'etrade').
@@ -200,16 +228,25 @@ class BaseProtoFactory(ABC, Generic[T]):
             ValueError: If the source is not registered in `mappings`.
             TypeError: If the converter's target Proto class doesn't match `self.proto_class`.
         """
-        if source not in self.mappings:
-            available = list(self.mappings.keys())
+        remembered = self.__dict__.get("_proto_converters")
+        if remembered is None:
+            remembered = self.__dict__.setdefault("_proto_converters", {})
+        entry = remembered.get(source)
+        if entry is not None and entry[0] == _cache_generation:
+            return entry[1]
+
+        generation = _cache_generation
+        mappings = self.mappings
+        if source not in mappings:
+            available = list(mappings.keys())
             raise ValueError(f"Unknown source '{source}'. Available: {available}")
 
-        mapping_path = self.mappings[source]
-        converter = get_cached_converter(mapping_path)
+        converter = get_cached_converter(mappings[source])
 
-        # Validate proto_class matches (first time only, cached after)
+        # Validate proto_class matches (first time only, remembered after)
         self._validate_proto_class(converter, source)
 
+        remembered[source] = (generation, converter)
         return converter
 
     def _validate_proto_class(self, converter: ProtoConverter, source: str) -> None:
@@ -251,8 +288,8 @@ class BaseProtoFactory(ABC, Generic[T]):
 
         Efficiently reuses the same converter across all items in the list.
         """
-        converter = self._get_converter(source)
-        return [converter.to_proto(item, **extra) for item in json_list]
+        to_proto = self._get_converter(source)._compiled_to_proto()
+        return [to_proto(item, extra) for item in json_list]
 
     def _to_json(self, source: str, proto: T) -> Dict[str, Any]:
         """

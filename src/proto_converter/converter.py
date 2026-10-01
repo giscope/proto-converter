@@ -17,13 +17,28 @@ Usage:
 
 import importlib
 import logging
-from datetime import date, datetime
-from typing import Any, Callable, Dict, Type, TypeVar
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional, Type, TypeVar
 
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
+from proto_converter.compiler import compile_to_json, compile_to_proto
+from proto_converter.expressions import (  # noqa: F401 - registries re-exported for existing imports
+    CompiledExpression,
+    _expression_functions,
+    _expression_names,
+    check_engine,
+    get_default_expression_engine,
+    has_name,
+    is_plain_name,
+    register_expression_function,
+    register_expression_name,
+    report_failure,
+    resolve_name,
+)
 from proto_converter.helpers import get_nested_value, set_nested_value
+from proto_converter.timestamps import parse_epoch, parse_iso8601, parse_yyyymmdd, set_timestamp
 from proto_converter.transforms import TRANSFORMS
 
 logger = logging.getLogger(__name__)
@@ -32,40 +47,45 @@ T = TypeVar("T", bound=Message)
 
 
 # =============================================================================
-# Expression Context Registry
+# Mapping path fallback
 # =============================================================================
 
-# Functions available inside YAML expression evaluations
-_expression_functions: Dict[str, Callable] = {}
-
-# Named constants/variables available inside YAML expression evaluations
-_expression_names: Dict[str, Any] = {}
-
-
-def register_expression_function(name: str, fn: Callable) -> None:
+class _PathFallback:
     """
-    Register a function available in YAML `type: expression` evaluations.
+    Resolve a `mappings` value that names a source field (`account_id`, `product.type`)
+    when the field is absent from the payload.
 
-    Example:
-        register_expression_function("generate_uid", my_uid_generator)
-
-        # Then in YAML:
-        #   expression: "generate_uid(data)"
+    Such a value has always fallen back to expression evaluation, so it can still read
+    extra fields, registered names, `data.x` and attributes of source objects. When
+    its first name resolves nowhere, the result is None without building an evaluator,
+    and the failure is logged once per mapping value instead of once per message.
     """
-    _expression_functions[name] = fn
 
+    __slots__ = ("text", "_root", "_bare", "_expression", "_warned")
 
-def register_expression_name(name: str, value: Any) -> None:
-    """
-    Register a named constant or variable available in YAML expressions.
+    def __init__(self, text: str, engine: str):
+        self.text = text
+        root = text.split(".", 1)[0]
+        self._root = root if is_plain_name(root) else None
+        self._bare = self._root is not None and "." not in text
+        self._expression = None if self._bare else CompiledExpression(text, engine)
+        self._warned = False
 
-    Example:
-        register_expression_name("SECURITY_TYPE_EQUITY", 1)
-
-        # Then in YAML:
-        #   expression: "SECURITY_TYPE_EQUITY if ticker else 0"
-    """
-    _expression_names[name] = value
+    def __call__(self, source: Dict[str, Any], extra: Dict[str, Any]) -> Any:
+        try:
+            if self._bare:
+                return resolve_name(self.text, source, extra)
+            if self._root is not None and not has_name(self._root, source, extra):
+                raise NameError(f"name '{self._root}' is not defined")
+            return self._expression.evaluate(source, extra)
+        except Exception as e:
+            if not self._warned:
+                self._warned = True
+                logger.warning(
+                    f"Expression eval failed for '{self.text}': {e} "
+                    "(not logged again for this mapping value)"
+                )
+            return None
 
 
 # =============================================================================
@@ -86,20 +106,65 @@ class ProtoConverter:
     - Type Safety: Validates that the generated Protobuf matches the expected class.
     - Consistency: Standardizes the mapping logic across different data sources.
     - Extensible: Custom transforms and expression functions can be registered at runtime.
+
+    Performance:
+    - The configuration is compiled into a generated Python function on the first
+      conversion (see `compiler.py`). Assigning a new `config` recompiles; after
+      mutating the config dict in place, call `recompile()` on this instance.
+    - Expressions are parsed once. `expression_engine="native"` compiles them to
+      Python code; see `expressions.py` for what that trades away.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], *, expression_engine: Optional[str] = None):
         """
         Initialize the converter with a mapping configuration.
 
         Args:
             config: Dictionary containing 'proto_class', 'type_maps', and 'fields'.
+            expression_engine: "sandboxed" or "native" for this converter's expressions.
+                None uses the process default (`set_default_expression_engine`), which
+                is "sandboxed" unless changed. Mapping YAML cannot choose the engine.
         """
+        self._requested_engine = None if expression_engine is None else check_engine(expression_engine)
         self.config = config
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return self._config
+
+    @config.setter
+    def config(self, config: Dict[str, Any]) -> None:
+        """Replace the configuration, dropping everything compiled from the old one."""
+        self._config = config
         self._proto_class = None
         self._proto_module = None
         self._additional_modules = []
         self._type_maps = None
+        self._engine: Optional[str] = None
+        self._to_proto_fn: Optional[Callable[[Any, Dict[str, Any]], Message]] = None
+        self._to_proto_source: Optional[str] = None
+        self._to_json_fn: Optional[Callable[[Message], Dict[str, Any]]] = None
+        self._extra_setters: Dict[str, Optional[Callable[[Message, Any], None]]] = {}
+        self._expressions: Dict[Any, CompiledExpression] = {}
+        self._path_fallbacks: Dict[str, _PathFallback] = {}
+
+    def recompile(self) -> None:
+        """
+        Drop everything derived from the config, so the next conversion compiles it afresh.
+
+        Needed only after mutating `config` in place (assigning a new config already does
+        this). Resets the resolved message class, enum maps, expression engine choice,
+        compiled functions, parsed expressions and extra-field setters.
+        `clear_converter_cache()` does not reach converters you already hold.
+        """
+        self.config = self._config
+
+    @property
+    def expression_engine(self) -> str:
+        """The engine this converter's expressions run on, fixed on first use."""
+        if self._engine is None:
+            self._engine = self._requested_engine or get_default_expression_engine()
+        return self._engine
 
     @property
     def proto_class(self) -> Type[Message]:
@@ -183,14 +248,64 @@ class ProtoConverter:
         """
         Create a Protobuf message from a JSON dictionary.
         """
+        to_proto = self._to_proto_fn
+        if to_proto is None:
+            to_proto = self._compiled_to_proto()
+        return to_proto(json_data, extra_fields)
+
+    def _compiled_to_proto(self) -> Callable[[Any, Dict[str, Any]], Message]:
+        """The generated `to_proto(source, extra_fields)` function, compiling it on first use."""
+        if self._to_proto_fn is None:
+            self._to_proto_fn = compile_to_proto(self)
+        return self._to_proto_fn
+
+    def to_json(self, proto: Message) -> Dict[str, Any]:
+        """
+        Reverse convert a Protobuf message back to a JSON dictionary.
+
+        Args:
+            proto: Source Protobuf message.
+
+        Returns:
+            Dict[str, Any]: JSON-compatible dictionary.
+        """
+        to_json = self._to_json_fn
+        if to_json is None:
+            to_json = self._to_json_fn = compile_to_json(self)
+        return to_json(proto)
+
+    def _expression(self, expr: Any) -> CompiledExpression:
+        """The compiled form of an expression string, parsed once per converter."""
+        try:
+            compiled = self._expressions.get(expr)
+        except TypeError:  # unhashable YAML value; it fails on evaluation, as before
+            return CompiledExpression(expr, self.expression_engine)
+        if compiled is None:
+            compiled = self._expressions[expr] = CompiledExpression(expr, self.expression_engine)
+        return compiled
+
+    def _path_fallback(self, text: str) -> _PathFallback:
+        """The fallback for a `mappings` value naming a source field, shared by both paths."""
+        fallback = self._path_fallbacks.get(text)
+        if fallback is None:
+            fallback = self._path_fallbacks[text] = _PathFallback(text, self.expression_engine)
+        return fallback
+
+    # =========================================================================
+    # Reference implementation
+    #
+    # The compiler emits fast code for the field shapes it can prove equivalent to
+    # these methods and calls them for everything else; the test suite runs both
+    # against each other, so behavior never depends on which path a field took.
+    # =========================================================================
+
+    def _reference_to_proto(self, json_data: Dict[str, Any], extra_fields: Dict[str, Any]) -> T:
+        """`to_proto` without compilation: the behavior the compiled function must match."""
         proto = self.proto_class()
 
         # 1. Support legacy 'fields' list format
         if "fields" in self.config:
-            for field_config in self.config["fields"]:
-                value = self._convert_field_to_proto(field_config, json_data, **extra_fields)
-                if value is not None:
-                    self._set_proto_field(proto, field_config["proto_field"], value)
+            self._reference_fields(proto, self.config["fields"], json_data, extra_fields)
 
         # 2. Support new 'mappings' dictionary format (includes recursion)
         if "mappings" in self.config:
@@ -202,6 +317,15 @@ class ProtoConverter:
                 self._set_proto_field(proto, field_name, value)
 
         return proto
+
+    def _reference_fields(self, proto: Message, fields: Any, source: Dict[str, Any], extra_fields: Dict[str, Any]) -> None:
+        for field_config in fields:
+            self._reference_field(proto, field_config, source, extra_fields)
+
+    def _reference_field(self, proto: Message, field_config: Dict[str, Any], source: Dict[str, Any], extra_fields: Dict[str, Any]) -> None:
+        value = self._convert_field_to_proto(field_config, source, extra_fields)
+        if value is not None:
+            self._set_proto_field(proto, field_config["proto_field"], value)
 
     def _apply_mappings(self, target: Message, mappings: Dict[str, Any], source: Dict[str, Any], extra_fields: Dict[str, Any]) -> None:
         """Recursive helper to apply dictionary-based mappings to a proto message."""
@@ -229,73 +353,71 @@ class ProtoConverter:
             return config
 
         # 1. Simple direct field lookup (no operators, just a field name)
-        if config.isidentifier() and config in source:
-            return source[config]
+        if config.isidentifier():
+            if config in source:
+                return source[config]
+            return self._path_fallback(config)(source, extra_fields)
 
         # 2. Dotted path lookup (e.g. "product.type")
         if "." in config and " " not in config and not any(c in config for c in "()+-*/"):
             val = get_nested_value(source, config)
             if val is not None:
                 return val
+            return self._path_fallback(config)(source, extra_fields)
 
         # 3. Fallback to expression evaluation (the most powerful path)
-        field_config = {"type": "expression", "expression": config}
-        return self._convert_field_to_proto(field_config, source, **extra_fields)
+        try:
+            return self._expression(config).evaluate(source, extra_fields)
+        except Exception as e:
+            return report_failure(config, e, None)
 
-    def to_json(self, proto: Message) -> Dict[str, Any]:
-        """
-        Reverse convert a Protobuf message back to a JSON dictionary.
-
-        Args:
-            proto: Source Protobuf message.
-
-        Returns:
-            Dict[str, Any]: JSON-compatible dictionary.
-        """
+    def _reference_to_json(self, proto: Message) -> Dict[str, Any]:
+        """`to_json` without the precompiled plan: the behavior the plan must match."""
         result = {}
-
         for field_config in self.config.get("fields", []):
-            json_path = field_config.get("json_path")
-            if not json_path:
-                continue
-
-            proto_field = field_config["proto_field"]
-
-            # Handle nested proto fields (e.g., "security.id")
-            if "." in proto_field:
-                parts = proto_field.split(".")
-                value = proto
-                for part in parts:
-                    if value is None:
-                        break
-                    value = getattr(value, part, None)
-            else:
-                value = getattr(proto, proto_field, None)
-
-            # Handle specialized types for JSON output
-            if isinstance(value, Timestamp):
-                if value.seconds > 0 or value.nanos > 0:
-                    unit = field_config.get("unit", "ms")
-                    epoch = value.seconds + value.nanos / 1e9
-                    value = int(epoch * 1000) if unit == "ms" else int(epoch)
-                else:
-                    value = None
-            elif field_config.get("type") == "enum":
-                type_map_name = field_config.get("type_map")
-                if type_map_name and type_map_name in self.type_maps:
-                    tmap = self.type_maps[type_map_name]
-                    value = tmap["reverse"].get(value, value)
-
-            if value is not None:
-                set_nested_value(result, json_path, value)
-
+            self._reference_json_field(proto, field_config, result)
         return result
+
+    def _reference_json_field(self, proto: Message, field_config: Dict[str, Any], result: Dict[str, Any]) -> None:
+        json_path = field_config.get("json_path")
+        if not json_path:
+            return
+
+        proto_field = field_config["proto_field"]
+
+        # Handle nested proto fields (e.g., "security.id")
+        if "." in proto_field:
+            parts = proto_field.split(".")
+            value = proto
+            for part in parts:
+                if value is None:
+                    break
+                value = getattr(value, part, None)
+        else:
+            value = getattr(proto, proto_field, None)
+
+        # Handle specialized types for JSON output
+        if isinstance(value, Timestamp):
+            if value.seconds > 0 or value.nanos > 0:
+                unit = field_config.get("unit", "ms")
+                epoch = value.seconds + value.nanos / 1e9
+                value = int(epoch * 1000) if unit == "ms" else int(epoch)
+            else:
+                value = None
+        elif field_config.get("type") == "enum":
+            type_map_name = field_config.get("type_map")
+            if type_map_name and type_map_name in self.type_maps:
+                tmap = self.type_maps[type_map_name]
+                value = tmap["reverse"].get(value, value)
+
+        if value is not None:
+            set_nested_value(result, json_path, value)
 
     def _convert_field_to_proto(
         self,
         field_config: Dict[str, Any],
         source: Dict[str, Any],
-        **extra_fields
+        extra_fields: Dict[str, Any],
     ) -> Any:
         """
         Execute the specific conversion logic for a single field.
@@ -329,96 +451,38 @@ class ProtoConverter:
         elif field_type == "timestamp":
             if json_value is None:
                 return None
-            try:
-                fmt = field_config.get("format", "epoch")
-                if fmt == "iso8601":
-                    # Parse ISO8601 date string (e.g., "2024-07-04T09:30:00Z")
-                    import dateutil.parser
-                    val_str = str(json_value)
-                    # If it's a date-only string (YYYY-MM-DD), force it to UTC midnight
-                    if len(val_str) == 10 and val_str.count("-") == 2 and "T" not in val_str:
-                        val_str += "T00:00:00Z"
-                    return dateutil.parser.parse(val_str)
-                elif fmt == "date_yyyymmdd":
-                    # Parse date string in YYYYMMDD format (e.g., "20260116")
-                    date_str = str(json_value)
-                    if len(date_str) >= 8:
-                        return datetime.strptime(date_str[:8], "%Y%m%d")
-                    return None
-                else:
-                    # Epoch timestamp (default)
-                    unit = field_config.get("unit", "ms")
-                    epoch = int(json_value)
-                    if unit == "ms":
-                        epoch = epoch / 1000
-                    return datetime.fromtimestamp(epoch)
-            except (ValueError, TypeError, OSError) as e:
-                logger.debug(f"Timestamp parse error: {e}")
-                return None
+            fmt = field_config.get("format", "epoch")
+            if fmt == "iso8601":
+                # ISO8601 date string (e.g., "2024-07-04T09:30:00Z"); YYYY-MM-DD is UTC midnight
+                return parse_iso8601(json_value)
+            elif fmt == "date_yyyymmdd":
+                # Date string in YYYYMMDD format (e.g., "20260116")
+                return parse_yyyymmdd(json_value)
+            else:
+                # Epoch timestamp (default), in UTC
+                return parse_epoch(json_value, field_config.get("unit", "ms") == "ms")
 
         elif field_type == "constant":
             # Direct constant value from YAML (useful for enums/fixed flags)
             return field_config.get("value")
 
         elif field_type in ("expression", "calculated"):
+            # [SECURITY] Sandboxed Expression Evaluation (see expressions.py)
+            # simpleeval parses expressions into an AST and only allows whitelisted
+            # operations, blocking attribute chain attacks ().__class__ and imports.
             expr = field_config.get("expression", "")
             try:
-                # [SECURITY] Sandboxed Expression Evaluation
-                # simpleeval parses expressions into an AST and only allows whitelisted
-                # operations, blocking attribute chain attacks ().__class__ and imports.
-                from simpleeval import EvalWithCompoundTypes
-                import base64
-
-                # Built-in safe functions
-                safe_functions = {
-                    "int": int, "str": str, "float": float, "bool": bool,
-                    "abs": abs, "len": len, "min": min, "max": max, "round": round,
-                    "get": lambda p, default=None: get_nested_value(source, p, default),
-                    "datetime": datetime,
-                }
-                # Merge registered expression functions
-                safe_functions.update(_expression_functions)
-
-                # Helper to allow dot-access on dictionaries in expressions
-                class DotDict(dict):
-                    def __getattr__(self, name):
-                        if name in self:
-                            val = self[name]
-                            if isinstance(val, dict):
-                                return DotDict(val)
-                            return val
-                        return None
-
-                # Context variables accessible in expressions
-                names = {
-                    "data": source,
-                    "p": source,  # Compatibility
-                    "base64": base64,
-                    "list": list,
-                    "dict": dict,
-                    # Provide extra fields and source data directly to expressions
-                    **{k: (DotDict(v) if isinstance(v, dict) else v) for k, v in source.items()},
-                    **extra_fields,
-                }
-                # Merge registered expression names
-                names.update(_expression_names)
-
-                import ast
-                evaluator = EvalWithCompoundTypes(names=names, functions=safe_functions)
-                # Explicitly enable list/dict nodes even if the whitelisting is strict
-                evaluator.nodes[ast.List] = evaluator._eval_list
-                evaluator.nodes[ast.Dict] = evaluator._eval_dict
-                return evaluator.eval(expr)
+                return self._expression(expr).evaluate(source, extra_fields)
             except Exception as e:
-                logger.warning(f"Expression eval failed for '{expr}': {e}")
-                return default
+                return report_failure(expr, e, default)
 
         return default
 
     def __getattr__(self, name):
         """Allow accessing config values as attributes for convenience."""
-        if name in self.config:
-            return self.config[name]
+        config = self.__dict__.get("_config")
+        if config is not None and name in config:
+            return config[name]
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
     def _set_proto_field(self, proto: Message, field_name: str, value: Any) -> None:
@@ -432,14 +496,15 @@ class ProtoConverter:
             for part in parts[:-1]:
                 target = getattr(target, part)
             field_name = parts[-1]
-            field_obj = getattr(target, field_name, None)
         else:
             target = proto
-            field_obj = getattr(proto, field_name, None)
+        self._assign_field(target, field_name, getattr(target, field_name, None), value)
 
+    def _assign_field(self, target: Message, field_name: str, field_obj: Any, value: Any) -> None:
+        """Set `target.<field_name>` (currently `field_obj`) to `value`, adapting the value to the field's type."""
         # Handle Timestamp fields
         if isinstance(field_obj, Timestamp) and isinstance(value, datetime):
-            field_obj.FromDatetime(value)
+            set_timestamp(field_obj, value)
             return
 
         # Handle google.type.Date fields

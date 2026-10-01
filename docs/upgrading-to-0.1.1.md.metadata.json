@@ -1,0 +1,5 @@
+{
+  "artifactType": "ARTIFACT_TYPE_OTHER",
+  "summary": "Migration guide for proto-converter 0.1.1 (performance release): what to check, corrected behaviour, new options, performance, repository lock and CI.",
+  "updatedAt": "2026-10-01T03:21:09Z"
+}

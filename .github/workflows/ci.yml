@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  locked:
+    # The gate: the suite against uv.lock on every Python the manifest allows.
+    # The ISO-8601 fast path relies on datetime.fromisoformat, whose accepted forms
+    # differ between Python versions, so each version runs its equivalence fuzz.
+    name: tests (py${{ matrix.python }}, locked)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # tests/test_against_baseline.py extracts the pre-overhaul commit 974baa1
+          # from git history; in a shallow clone those tests would skip.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run tests (frozen lock)
+        run: uv run --frozen --extra test pytest -q
+
+  lowest:
+    # The manifest's floors (protobuf 5.26, simpleeval 1.0.0, PyYAML 6.0,
+    # python-dateutil 2.8.0) on the oldest supported Python. simpleeval < 1.0.4
+    # has no per-result module checks; the native engine must match either way.
+    name: tests (lowest direct deps, py3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Run tests (lowest direct dependencies)
+        run: uv run --isolated --resolution lowest-direct --extra test pytest -q
+
+  benchmark:
+    # Speedup gates and output identity against 974baa1, measured in one process.
+    # Informational on shared runners, whose timing noise can move a ratio past
+    # its gate; the release procedure runs `--check` as a blocking gate.
+    name: benchmark vs 974baa1 (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Benchmark
+        run: uv run --frozen --extra test python bench/bench_converter.py --check
