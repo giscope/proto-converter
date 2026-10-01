@@ -1,5 +1,5 @@
 {
   "artifactType": "ARTIFACT_TYPE_IMPLEMENTATION_PLAN",
-  "summary": "DONE Living Plan for the proto-converter performance overhaul (baseline 974baa1): typical message 18x faster sandboxed / 23x native, outputs identical under UTC, owner review R1\u2013R6 addressed; commit/release pending DC-132.",
-  "updatedAt": "2026-10-01T03:21:09Z"
+  "summary": "DONE Living Plan for the proto-converter performance overhaul, released as v0.1.1 (f057e4c): typical message 16-17x faster sandboxed / 21-22x native vs 974baa1 with identical outputs under UTC.",
+  "updatedAt": "2026-10-01T03:23:12Z"
 }

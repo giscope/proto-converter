@@ -1,8 +1,8 @@
 # Performance overhaul — proto-converter
 
-**Status:** IN PROGRESS · **Progress:** 25/26 · Phase 3/3 · **Last updated:** 2026-10-01 03:21 UTC · claude-opus-5-5
+**Status:** DONE · **Progress:** 26/26 · Phase 3/3 · **Last updated:** 2026-10-01 03:23 UTC · claude-opus-5-5
 
-**As-Built (2026-10-01 02:41 UTC):** `to_proto` is generated per mapping with descriptor-chosen setters and a reference fallback; expressions are parsed once (pooled simpleeval, opt-in native engine on a copied AST); factories remember converters per source; ISO/epoch parsing fast paths proven equal to `974baa1`. `typical_message` 79–80 µs → 4.5 µs sandboxed (17.5–18.0×) / 3.4–3.6 µs native (22.6–23.0×) over two runs; 173 tests pass; uncommitted pending DC-132.
+**As-Built (2026-10-01 02:41 UTC):** `to_proto` is generated per mapping with descriptor-chosen setters and a reference fallback; expressions are parsed once (pooled simpleeval, opt-in native engine on a copied AST); factories remember converters per source; ISO/epoch parsing fast paths proven equal to `974baa1`. `typical_message` 79–80 µs → 4.5 µs sandboxed (17.5–18.0×) / 3.4–3.6 µs native (22.6–23.0×) over two runs; 173 tests pass; released as v0.1.1 (`f057e4c`, https://github.com/giscope/proto-converter/releases/tag/v0.1.1).
 
 ## Goal
 
@@ -180,4 +180,4 @@ the ledger read 0/16 — fixed.
 - [x] C2 Upgrade guide `docs/upgrading-to-0.1.1.md` in proto-llm's `docs/upgrading-to-<version>.md` shape (owner request 2026-10-01) — file + sidecar; linked from `README.md`
 - [x] C3 `uv.lock` + CI `.github/workflows/ci.yml` (owner: "fix the CI and lockfile") — locked suite 174 passed on py3.11 / 3.12 / 3.13 (uv run --frozen --extra test); lowest direct deps (protobuf 5.26.0, simpleeval 1.0.0, PyYAML 6.0, python-dateutil 2.8.0, py3.11) 174 passed; protobuf 6.33.5 (emo-trader-2's) 174 passed; CI run on the pushed head recorded under C5
 - [x] C4 Native engine applies simpleeval ≥ 1.0.4 per-result checks (modules / forbidden functions), found when the lock resolved simpleeval 1.0.8 (the old venv had 1.0.3); expressions compiled as functions so helpers are C-speed globals — `src/proto_converter/expressions.py` `_native_check`, `_compile_native`; `tests/test_expressions.py::test_both_engines_apply_the_installed_simpleevals_result_checks` pass; release-gate bench with the lock: typical_message 75.77 → 4.70 µs (16.1×), typical_message_native → 3.55 µs (21.4×), expression_native 17.2×, all 11 gates met, outputs identical
-- [/] C5 Release v0.1.1: version bump, commit, push `master`, CI green, tag, GitHub release — DC-132
+- [x] C5 Release v0.1.1: version bump, commit, push `master`, CI green, tag, GitHub release — DC-132 closed · commit `f057e4c` on `master`; CI run 36810134602 success (locked py3.11/3.12/3.13, lowest deps, benchmark: typical 17.1× sandboxed / 21.7× native on the Linux runner); annotated tag `v0.1.1` → `f057e4c`; release https://github.com/giscope/proto-converter/releases/tag/v0.1.1; record: `.agent/artifacts/release-v0.1.1.md`
